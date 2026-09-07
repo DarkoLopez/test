@@ -12,6 +12,10 @@ on:
         description: 'mojito branch to track when no commit is given'
         required: false
         default: master
+      target_branch:
+        description: 'Branch in this repo to update (defaults to master)'
+        required: false
+        default: master
 
 # One updater at a time: two dispatches landing together must not race on master.
 concurrency:
@@ -24,17 +28,19 @@ permissions:
 env:
   MOJITO_REPO: https://github.com/DarkoLopez/test2.git
   COMMIT_FILE: mojito_commit.txt
-  # A dispatch may only ever point us at this branch. Manual runs can override.
   TRACKED_BRANCH: master
+  TARGET_BRANCH: ${{ inputs.target_branch || 'master' }}
 
 jobs:
   update-mojito-commit:
     name: Update mojito_commit.txt
     runs-on: default
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # Pinned: this job holds a push credential in .git/config for its whole life.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: master
+          ref: ${{ env.TARGET_BRANCH }}
           # A PAT is needed to push to a protected master; GITHUB_TOKEN is the
           # fallback for repos where master is unprotected.
           token: ${{ secrets.MOJITO_COMMIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
@@ -49,15 +55,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          branch="${REQUESTED_BRANCH:-$TRACKED_BRANCH}"
-          if ! printf '%s' "$branch" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
-            echo "::error::refusing to use branch name '$branch'"
-            exit 1
-          fi
+          # Safe both as a path component of a ref and as a bare git argument.
+          valid_ref() {
+            case "$1" in
+              -*|*..*|*//*|*/) return 1 ;;
+            esac
+            printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._/-]+$'
+          }
 
-          # The dispatch PAT lives in a public repo, so a dispatch gets no say in
-          # which branch we track. Only a manual run (which requires write access
-          # here) may point at another branch.
+          branch="${REQUESTED_BRANCH:-$TRACKED_BRANCH}"
+          for ref in "$branch" "$TARGET_BRANCH"; do
+            if ! valid_ref "$ref"; then
+              echo "::error::refusing to use branch name '$ref'"
+              exit 1
+            fi
+          done
+
           if [ "$EVENT_NAME" = 'repository_dispatch' ] && [ "$branch" != "$TRACKED_BRANCH" ]; then
             echo "::error::dispatch asked for branch '$branch', only '$TRACKED_BRANCH' is accepted"
             exit 1
@@ -70,20 +83,31 @@ jobs:
           fi
 
           sha="${REQUESTED_SHA:-}"
+
+          if [ "$EVENT_NAME" != 'workflow_dispatch' ] && [ -n "$sha" ]; then
+            # A dispatch is a trigger, not an instruction. The concurrency group
+            # gives no ordering guarantee, so honouring the payload SHA would let
+            # two pushes to mojito master landing out of order walk this file
+            # backwards. The branch head is always the payload SHA or newer.
+            if [ "$sha" != "$head" ]; then
+              echo "dispatch carried $sha; tracking $branch head $head instead"
+            fi
+            sha=''
+          fi
+
           if [ -z "$sha" ]; then
             sha="$head"
           elif ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::expected a full 40-char lowercase SHA, got '$sha'"
             exit 1
           elif [ "$sha" != "$head" ]; then
-            # $branch has moved since the dispatch was sent (or a manual run
-            # pinned an older commit). Prove the commit is really in mojito and
-            # is an ancestor of the branch head, so a stolen dispatch token
-            # cannot pin an arbitrary or off-branch object.
+            # A manual run pinned something other than the head, typically a
+            # rollback. Prove the commit really is on $branch in mojito before we
+            # deploy it, rather than an arbitrary or off-branch object.
             scratch="$RUNNER_TEMP/mojito-verify"
             rm -rf "$scratch"
             git init -q "$scratch"
-            if ! git -C "$scratch" fetch -q --depth 50 "$MOJITO_REPO" "$branch"; then
+            if ! git -C "$scratch" fetch -q --depth 50 "$MOJITO_REPO" "refs/heads/$branch"; then
               echo "::error::could not fetch '$branch' from $MOJITO_REPO"
               exit 1
             fi
@@ -105,7 +129,6 @@ jobs:
           current=$(tr -d '[:space:]' < "$COMMIT_FILE" 2>/dev/null || true)
           if [ "$current" = "$SHA" ]; then
             echo "$COMMIT_FILE is already at $SHA, nothing to do"
-            echo "$COMMIT_FILE already at \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -118,22 +141,28 @@ jobs:
           git commit -m "$message"
 
           for attempt in 1 2 3; do
-            if git push origin HEAD:master; then
-              echo "Pushed \`$SHA\` to master (was \`${current:-empty}\`)" >> "$GITHUB_STEP_SUMMARY"
+            if git push origin HEAD:"$TARGET_BRANCH"; then
+              echo "Pushed $SHA to $TARGET_BRANCH"
+              echo "Updated \`$COMMIT_FILE\` to \`$SHA\` on \`$TARGET_BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
 
-            echo "Push rejected, re-syncing with origin/master (attempt $attempt)"
-            git fetch origin master
-            remote=$(git show "origin/master:$COMMIT_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+            # Someone pushed while we were working. Let their push settle, then
+            # rebuild our commit on top of it.
+            sleep $((attempt * 3))
+            echo "Push rejected, re-syncing with origin/${TARGET_BRANCH} (attempt $attempt)"
+            if ! git fetch origin "$TARGET_BRANCH"; then
+              echo "::error::could not fetch origin/$TARGET_BRANCH to re-sync"
+              exit 1
+            fi
+
+            remote=$(git show "origin/$TARGET_BRANCH:$COMMIT_FILE" 2>/dev/null | tr -d '[:space:]' || true)
             if [ "$remote" = "$SHA" ]; then
-              echo "origin/master is already at $SHA, nothing to do"
+              echo "origin/${TARGET_BRANCH} is already at $SHA, nothing to do"
               exit 0
             fi
 
-            # Rebuild the one-line change on top of the new master instead of
-            # rebasing, which would just conflict on the same single line.
-            git reset --hard origin/master
+            git reset --hard "origin/$TARGET_BRANCH"
             printf '%s\n' "$SHA" > "$COMMIT_FILE"
             git add "$COMMIT_FILE"
             git commit -m "$message"
