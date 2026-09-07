@@ -1,0 +1,143 @@
+name: Update mojito_commit.txt
+on:
+  repository_dispatch:
+    types: [mojito-updated]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Full 40-char mojito commit SHA (defaults to the head of the tracked branch)'
+        required: false
+        default: ''
+      branch:
+        description: 'mojito branch to track when no commit is given'
+        required: false
+        default: master
+
+# One updater at a time: two dispatches landing together must not race on master.
+concurrency:
+  group: update-mojito-commit
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  MOJITO_REPO: https://github.com/DarkoLopez/test2.git
+  COMMIT_FILE: mojito_commit.txt
+  # A dispatch may only ever point us at this branch. Manual runs can override.
+  TRACKED_BRANCH: master
+
+jobs:
+  update-mojito-commit:
+    name: Update mojito_commit.txt
+    runs-on: default
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          # A PAT is needed to push to a protected master; GITHUB_TOKEN is the
+          # fallback for repos where master is unprotected.
+          token: ${{ secrets.MOJITO_COMMIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Resolve mojito commit
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_SHA: ${{ github.event.client_payload.sha || inputs.commit }}
+          REQUESTED_BRANCH: ${{ github.event.client_payload.branch || inputs.branch }}
+        run: |
+          set -euo pipefail
+
+          branch="${REQUESTED_BRANCH:-$TRACKED_BRANCH}"
+          if ! printf '%s' "$branch" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "::error::refusing to use branch name '$branch'"
+            exit 1
+          fi
+
+          # The dispatch PAT lives in a public repo, so a dispatch gets no say in
+          # which branch we track. Only a manual run (which requires write access
+          # here) may point at another branch.
+          if [ "$EVENT_NAME" = 'repository_dispatch' ] && [ "$branch" != "$TRACKED_BRANCH" ]; then
+            echo "::error::dispatch asked for branch '$branch', only '$TRACKED_BRANCH' is accepted"
+            exit 1
+          fi
+
+          head=$(git ls-remote "$MOJITO_REPO" "refs/heads/$branch" | cut -f1)
+          if [ -z "$head" ]; then
+            echo "::error::branch '$branch' not found in $MOJITO_REPO"
+            exit 1
+          fi
+
+          sha="${REQUESTED_SHA:-}"
+          if [ -z "$sha" ]; then
+            sha="$head"
+          elif ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::expected a full 40-char lowercase SHA, got '$sha'"
+            exit 1
+          elif [ "$sha" != "$head" ]; then
+            # $branch has moved since the dispatch was sent (or a manual run
+            # pinned an older commit). Prove the commit is really in mojito and
+            # is an ancestor of the branch head, so a stolen dispatch token
+            # cannot pin an arbitrary or off-branch object.
+            scratch="$RUNNER_TEMP/mojito-verify"
+            rm -rf "$scratch"
+            git init -q "$scratch"
+            if ! git -C "$scratch" fetch -q --depth 50 "$MOJITO_REPO" "$branch"; then
+              echo "::error::could not fetch '$branch' from $MOJITO_REPO"
+              exit 1
+            fi
+            if ! git -C "$scratch" merge-base --is-ancestor "$sha" FETCH_HEAD 2>/dev/null; then
+              echo "::error::$sha is not among the last 50 commits of $branch"
+              exit 1
+            fi
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Tracking $branch at $sha (head is $head)"
+
+      - name: Commit and push
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          current=$(tr -d '[:space:]' < "$COMMIT_FILE" 2>/dev/null || true)
+          if [ "$current" = "$SHA" ]; then
+            echo "$COMMIT_FILE is already at $SHA, nothing to do"
+            echo "$COMMIT_FILE already at \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          message="Update mojito_commit.txt to ${SHA:0:7}"
+          printf '%s\n' "$SHA" > "$COMMIT_FILE"
+          git add "$COMMIT_FILE"
+          git commit -m "$message"
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:master; then
+              echo "Pushed \`$SHA\` to master (was \`${current:-empty}\`)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            echo "Push rejected, re-syncing with origin/master (attempt $attempt)"
+            git fetch origin master
+            remote=$(git show "origin/master:$COMMIT_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ "$remote" = "$SHA" ]; then
+              echo "origin/master is already at $SHA, nothing to do"
+              exit 0
+            fi
+
+            # Rebuild the one-line change on top of the new master instead of
+            # rebasing, which would just conflict on the same single line.
+            git reset --hard origin/master
+            printf '%s\n' "$SHA" > "$COMMIT_FILE"
+            git add "$COMMIT_FILE"
+            git commit -m "$message"
+          done
+
+          echo "::error::could not push $COMMIT_FILE update after 3 attempts"
+          exit 1
