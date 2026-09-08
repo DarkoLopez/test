@@ -34,7 +34,7 @@ env:
 jobs:
   update-mojito-commit:
     name: Update mojito_commit.txt
-    runs-on: default
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       # Pinned: this job holds a push credential in .git/config for its whole life.
