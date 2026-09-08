@@ -17,19 +17,24 @@ on:
         required: false
         default: master
 
-# One updater at a time: two dispatches landing together must not race on master.
+# One updater at a time: two dispatches landing together must not race on the
+# rolling branch, which is force-updated rather than appended to.
 concurrency:
   group: update-mojito-commit
   cancel-in-progress: false
 
+# Exactly the two scopes the one API step exercises: contents to create and commit
+# to the rolling branch, pull-requests to open it and arm auto-merge. Neither is a
+# privilege over $TARGET_BRANCH, which stays protected -- the write lands on an
+# unprotected feature branch and the PR is what crosses into master.
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   MOJITO_REPO: https://github.com/DarkoLopez/test2.git
   COMMIT_FILE: mojito_commit.txt
   TRACKED_BRANCH: master
-  TARGET_BRANCH: ${{ inputs.target_branch || 'master' }}
 
 jobs:
   update-mojito-commit:
@@ -37,40 +42,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Pinned: this job holds a push credential in .git/config for its whole life.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ env.TARGET_BRANCH }}
-          # A PAT is needed to push to a protected master; GITHUB_TOKEN is the
-          # fallback for repos where master is unprotected.
-          token: ${{ secrets.MOJITO_COMMIT_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
-          persist-credentials: true
-
+      # Deliberately ahead of the token: this step is the only thing that sees
+      # the raw branch inputs, and it validates them before anything -- a git
+      # command, a ref lookup, or a credential existing at all -- uses one.
+      # Later steps take the re-published outputs, never the raw inputs.
       - name: Resolve mojito commit
         id: resolve
         env:
           EVENT_NAME: ${{ github.event_name }}
           REQUESTED_SHA: ${{ github.event.client_payload.sha || inputs.commit }}
           REQUESTED_BRANCH: ${{ github.event.client_payload.branch || inputs.branch }}
+          # Scoped to this step so no later step can reach the unvalidated value.
+          # repository_dispatch cannot set it: `inputs` is empty off a manual run.
+          REQUESTED_TARGET_BRANCH: ${{ inputs.target_branch || 'master' }}
         run: |
           set -euo pipefail
 
           # Safe both as a path component of a ref and as a bare git argument.
+          # [[ =~ ]] rather than grep -E on purpose: grep anchors ^ and $ per line,
+          # so a value whose *first* line is clean passes it. These values reach
+          # $GITHUB_OUTPUT, where a smuggled newline is a second key=value.
           valid_ref() {
             case "$1" in
               -*|*..*|*//*|*/) return 1 ;;
             esac
-            printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._/-]+$'
+            [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]]
           }
 
           branch="${REQUESTED_BRANCH:-$TRACKED_BRANCH}"
-          for ref in "$branch" "$TARGET_BRANCH"; do
+          target_branch="${REQUESTED_TARGET_BRANCH:-master}"
+          for ref in "$branch" "$target_branch"; do
             if ! valid_ref "$ref"; then
               echo "::error::refusing to use branch name '$ref'"
               exit 1
             fi
           done
 
+          # Only a manual run (which requires write access here) may point at another branch.
           if [ "$EVENT_NAME" = 'repository_dispatch' ] && [ "$branch" != "$TRACKED_BRANCH" ]; then
             echo "::error::dispatch asked for branch '$branch', only '$TRACKED_BRANCH' is accepted"
             exit 1
@@ -97,7 +105,7 @@ jobs:
 
           if [ -z "$sha" ]; then
             sha="$head"
-          elif ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+          elif [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::expected a full 40-char lowercase SHA, got '$sha'"
             exit 1
           elif [ "$sha" != "$head" ]; then
@@ -117,56 +125,184 @@ jobs:
             fi
           fi
 
+          # Both values are known-good here: valid_ref has constrained
+          # target_branch to [A-Za-z0-9._/-]+, so neither can break the file format
+          # nor the ref names built from it below.
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$target_branch" >> "$GITHUB_OUTPUT"
           echo "Tracking $branch at $sha (head is $head)"
+          echo "Opening a PR against $target_branch in this repo"
 
-      - name: Commit and push
+      # $TARGET_BRANCH is protected: it takes changes through a pull request only,
+      # and no bypass is wanted here. So the update is not pushed -- it is proposed.
+      #
+      # The job's own GITHUB_TOKEN is enough for that, and is preferred over an app
+      # installation token: it lasts only as long as the job and leaves no long-lived
+      # private key in the secret store. The usual reason a bot PR needs an app --
+      # that GITHUB_TOKEN-authored events spawn no workflow runs, so required checks
+      # never report and the PR blocks forever -- does not apply here. `Code Review
+      # Status` is posted by an org GitHub App off the `pull_request` webhook, not by
+      # an Actions workflow, and the deploy fires from Buildkite's push webhook;
+      # webhook delivery is not what the recursion guard suppresses.
+      #
+      # If this ever fails with "GitHub Actions is not permitted to create or approve
+      # pull requests", the org has that toggle off and this needs an app token
+      # (mojito-bot is already installed here with both scopes) instead.
+      #
+      # No checkout anywhere in this job: the resolve step queries mojito remotely,
+      # and everything here goes through the API. Nothing writes a credential to
+      # disk, so none is left sitting in .git/config for the life of the job.
+      - name: Open or update the mojito_commit PR
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           SHA: ${{ steps.resolve.outputs.sha }}
-        run: |
-          set -euo pipefail
+          TARGET_BRANCH: ${{ steps.resolve.outputs.target_branch }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
 
-          current=$(tr -d '[:space:]' < "$COMMIT_FILE" 2>/dev/null || true)
-          if [ "$current" = "$SHA" ]; then
-            echo "$COMMIT_FILE is already at $SHA, nothing to do"
-            exit 0
-          fi
+            const { owner, repo } = context.repo;
+            const sha = process.env.SHA;
+            const base = process.env.TARGET_BRANCH;
+            const file = process.env.COMMIT_FILE;
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            // One rolling branch per base, force-updated to the newest SHA, so a
+            // dispatch on every mojito master push updates one PR instead of
+            // opening one per commit. The base in the name keeps two different
+            // target branches from fighting over the same ref.
+            const branch = `auto/update-mojito-commit-${base}`;
+            const message = `Update ${file} to ${sha.slice(0, 7)}`;
 
-          message="Update mojito_commit.txt to ${SHA:0:7}"
-          printf '%s\n' "$SHA" > "$COMMIT_FILE"
-          git add "$COMMIT_FILE"
-          git commit -m "$message"
+            // Every way out of this step writes exactly one verdict line. A no-op is
+            // the common case here, so an empty summary must mean "did not run", never
+            // "ran and found nothing to do". The catch at the bottom is the backstop
+            // for an unexpected throw, which is the one failure that would otherwise
+            // leave no verdict at all.
+            const summarize = (line) => {
+              core.info(line);
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
+            };
 
-          for attempt in 1 2 3; do
-            if git push origin HEAD:"$TARGET_BRANCH"; then
-              echo "Pushed $SHA to $TARGET_BRANCH"
-              echo "Updated \`$COMMIT_FILE\` to \`$SHA\` on \`$TARGET_BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
+            // Whitespace-stripped, matching what the file is compared against
+            // everywhere else -- the value is a SHA, not a document.
+            const read = async (ref) => {
+              try {
+                const { data } = await github.rest.repos.getContent({ owner, repo, path: file, ref });
+                return {
+                  content: Buffer.from(data.content, 'base64').toString('utf8').replace(/\s/g, ''),
+                  blobSha: data.sha,
+                };
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            };
 
-            # Someone pushed while we were working. Let their push settle, then
-            # rebuild our commit on top of it.
-            sleep $((attempt * 3))
-            echo "Push rejected, re-syncing with origin/${TARGET_BRANCH} (attempt $attempt)"
-            if ! git fetch origin "$TARGET_BRANCH"; then
-              echo "::error::could not fetch origin/$TARGET_BRANCH to re-sync"
-              exit 1
-            fi
+            try {
+              const current = await read(base);
+              if (current && current.content === sha) {
+                summarize(`**No change** -- \`${file}\` is already at \`${sha}\` on \`${base}\``);
+                return;
+              }
+              const from = current && current.content ? current.content : 'none';
 
-            remote=$(git show "origin/$TARGET_BRANCH:$COMMIT_FILE" 2>/dev/null | tr -d '[:space:]' || true)
-            if [ "$remote" = "$SHA" ]; then
-              echo "origin/${TARGET_BRANCH} is already at $SHA, nothing to do"
-              exit 0
-            fi
+              const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${base}` });
+              const baseSha = baseRef.object.sha;
 
-            git reset --hard "origin/$TARGET_BRANCH"
-            printf '%s\n' "$SHA" > "$COMMIT_FILE"
-            git add "$COMMIT_FILE"
-            git commit -m "$message"
-          done
+              // Both paths are load-bearing: delete_branch_on_merge removes the
+              // branch when the PR lands, so runs alternate between creating it and
+              // force-resetting the one left over from an unmerged run.
+              try {
+                await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: baseSha });
+                core.info(`created ${branch} at ${baseSha}`);
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                await github.rest.git.updateRef({ owner, repo, ref: `heads/${branch}`, sha: baseSha, force: true });
+                core.info(`reset existing ${branch} to ${baseSha}`);
+              }
 
-          echo "::error::could not push $COMMIT_FILE update after 3 attempts"
-          exit 1
+              // This read is what supplies the blob SHA, which is the precondition
+              // that makes the write a compare-and-set rather than a blind overwrite.
+              // The value check is belt-and-braces: the branch was just reset to base,
+              // and base carrying $sha already returned above.
+              const onBranch = await read(branch);
+              if (!onBranch || onBranch.content !== sha) {
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner,
+                  repo,
+                  path: file,
+                  message,
+                  // Trailing newline, as the previous `printf '%s\n'` wrote it.
+                  content: Buffer.from(`${sha}\n`).toString('base64'),
+                  branch,
+                  ...(onBranch ? { sha: onBranch.blobSha } : {}),
+                });
+              }
+
+              // Reusing the open PR is what makes this rolling. Matching on head
+              // means a PR a human opened from this branch is updated, not duplicated.
+              const { data: open } = await github.rest.pulls.list({
+                owner,
+                repo,
+                base,
+                head: `${owner}:${branch}`,
+                state: 'open',
+              });
+
+              let pr = open[0];
+              let disposition = pr ? `updated PR #${pr.number}` : '';
+              if (!pr) {
+                const { data: created } = await github.rest.pulls.create({
+                  owner,
+                  repo,
+                  base,
+                  head: branch,
+                  title: message,
+                  body: [
+                    `Automated by \`.github/workflows/update-mojito-commit.yml\`.`,
+                    ``,
+                    `Points \`${file}\` at [\`${sha.slice(0, 7)}\`](https://github.com/pinterest/mojito/commit/${sha}) on pinterest/mojito \`${process.env.TRACKED_BRANCH}\`.`,
+                    ``,
+                    `This branch is force-updated as mojito moves, so this PR always carries the newest SHA. Merging it is what triggers a deploy build.`,
+                  ].join('\n'),
+                });
+                pr = created;
+                disposition = `opened PR #${pr.number}`;
+              }
+
+              // Auto-merge lands it the moment its requirements are met, with no
+              // bypass of branch protection. Squash is the only method this repo allows.
+              let landing;
+              try {
+                await github.graphql(
+                  `mutation($id: ID!) {
+                     enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: SQUASH }) {
+                       clientMutationId
+                     }
+                   }`,
+                  { id: pr.node_id },
+                );
+                landing = 'auto-merge armed';
+              } catch (error) {
+                // GitHub refuses to arm auto-merge when nothing is pending, which
+                // means the PR is already mergeable -- so merge it outright instead.
+                if (!/clean status/i.test(String(error.message))) throw error;
+                try {
+                  await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, merge_method: 'squash' });
+                  landing = 'merged immediately';
+                } catch (mergeError) {
+                  // The PR exists and carries the right SHA, which is this step's
+                  // job; a refused merge is a review gate, not a failure to report.
+                  core.warning(`could not merge PR #${pr.number}: ${mergeError.message}`);
+                  landing = 'left open, merge refused';
+                }
+              }
+
+              summarize(
+                `**Updated** \`${file}\` for \`${base}\`: \`${from}\` -> \`${sha}\` (${disposition}, ${landing})`,
+              );
+            } catch (error) {
+              summarize(`**Failed** -- ${error.message}`);
+              core.setFailed(error.message);
+            }
