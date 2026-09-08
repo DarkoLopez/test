@@ -140,7 +140,7 @@ jobs:
           private-key: ${{ secrets.MOJITO_COMMIT_APP_PRIVATE_KEY }}
           # Least privilege: this repo only, and only the two scopes the step below
           # actually exercises -- contents to commit, pull-requests to open and arm.
-          repositories: mojito-deploy
+          repositories: test
           permission-contents: write
           permission-pull-requests: write
 
