@@ -141,7 +141,7 @@ jobs:
           private-key: ${{ secrets.MOJITO_COMMIT_APP_PRIVATE_KEY }}
           # Least privilege: this repo only, and only the one scope the step below
           # actually exercises -- contents, to read and commit the file.
-          repositories: mojito-deploy
+          repositories: test
           permission-contents: write
 
       # No checkout anywhere in this job: the resolve step queries mojito remotely,
